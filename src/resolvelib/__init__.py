@@ -2,6 +2,7 @@ __all__ = [
     "AbstractProvider",
     "AbstractResolver",
     "BaseReporter",
+    "ConstraintsConflicted",
     "InconsistentCandidate",
     "RequirementsConflicted",
     "ResolutionError",
@@ -18,6 +19,7 @@ from .providers import AbstractProvider
 from .reporters import BaseReporter
 from .resolvers import (
     AbstractResolver,
+    ConstraintsConflicted,
     InconsistentCandidate,
     RequirementsConflicted,
     ResolutionError,
