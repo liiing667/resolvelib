@@ -12,6 +12,7 @@ from ..structs import (
     DirectedGraph,
     IterableView,
     IteratorMapping,
+    Matches,
     RequirementInformation,
     State,
     build_iter_view,
@@ -19,6 +20,7 @@ from ..structs import (
 from .abstract import AbstractResolver, Result
 from .criterion import Criterion
 from .exceptions import (
+    ConstraintsConflicted,
     InconsistentCandidate,
     RequirementsConflicted,
     ResolutionImpossible,
@@ -81,10 +83,65 @@ class Resolution(Generic[RT, CT, KT]):
         self._r = reporter
         self._states: list[State[RT, CT, KT]] = []
 
+        # Constraints merged by identifier, used to filter provider candidates.
+        self._constraints: dict[KT, list[RT]] = {}
+        # Set when constraints are known to have emptied a candidate pool, so
+        # a subsequent failure can be reported as constraint-caused.
+        self._constraint_conflict = False
+
         # Optimistic backjumping variables
         self._optimistic_backjumping_ratio = _OPTIMISTIC_BACKJUMPING_RATIO
         self._save_states: list[State[RT, CT, KT]] | None = None
         self._optimistic_start_round: int | None = None
+
+    def _merge_constraints(
+        self, constraints: Iterable[RequirementInformation[RT, CT]]
+    ) -> dict[KT, list[RT]]:
+        """Merge constraints into an identifier-to-requirements mapping.
+
+        Constraints are deduplicated and kept in first-seen order so the same
+        input always produces the same resolution result and causes ordering,
+        even when constraints are repeated or mutually contradictory.
+        """
+        merged: dict[KT, list[RT]] = {}
+        for requirement, _parent in constraints:
+            identifier = self._p.identify(requirement_or_candidate=requirement)
+            requirements = merged.setdefault(identifier, [])
+            if requirement not in requirements:
+                requirements.append(requirement)
+        return merged
+
+    def _apply_constraints(self, identifier: KT, matches: Matches[CT]) -> Matches[CT]:
+        """Filter provider candidates against constraints for an identifier.
+
+        Constraints only ever remove candidates; they never contribute
+        requirements to criteria, so they cannot appear in failure causes.
+        """
+        constraint_requirements = self._constraints.get(identifier)
+        if not constraint_requirements:
+            return matches
+        if callable(matches):
+            matches = matches()
+        unfiltered = list(matches)
+        kept = [
+            candidate
+            for candidate in unfiltered
+            if all(
+                self._p.is_satisfied_by(requirement=r, candidate=candidate)
+                for r in constraint_requirements
+            )
+        ]
+        if unfiltered and not kept:
+            self._constraint_conflict = True
+        return kept
+
+    def _impossible(
+        self, causes: list[RequirementInformation[RT, CT]]
+    ) -> ResolutionImpossible[RT, CT]:
+        """Build the failure exception, marking constraint-caused failures."""
+        if self._constraint_conflict:
+            return ConstraintsConflicted(causes)
+        return ResolutionImpossible(causes)
 
     @property
     def state(self) -> State[RT, CT, KT]:
@@ -135,6 +192,7 @@ class Resolution(Generic[RT, CT, KT]):
                 {identifier: incompatibilities},
             ),
         )
+        matches = self._apply_constraints(identifier, matches)
 
         if criterion:
             information = list(criterion.information)
@@ -272,6 +330,7 @@ class Resolution(Generic[RT, CT, KT]):
                     {k: incompatibilities},
                 ),
             )
+            matches = self._apply_constraints(k, matches)
             candidates: IterableView[CT] = build_iter_view(matches)
             if not candidates:
                 return False
@@ -350,7 +409,7 @@ class Resolution(Generic[RT, CT, KT]):
                     broken_state = self._states.pop()
                     name, candidate = broken_state.mapping.popitem()
                 except (IndexError, KeyError):
-                    raise ResolutionImpossible(causes) from None
+                    raise self._impossible(causes) from None
 
                 if (
                     not self._optimistic_backjumping_ratio
@@ -387,7 +446,7 @@ class Resolution(Generic[RT, CT, KT]):
                 # Guard: We need at least two state to remain to both
                 # backtrack and push a new state
                 if len(self._states) <= 1:
-                    raise ResolutionImpossible(causes)
+                    raise self._impossible(causes)
 
             incompatibilities_from_broken = [
                 (k, list(v.incompatibilities)) for k, v in broken_state.criteria.items()
@@ -415,11 +474,21 @@ class Resolution(Generic[RT, CT, KT]):
         """Extract causes from list of criteria and deduplicate"""
         return list({id(i): i for c in criteria for i in c.information}.values())
 
-    def resolve(self, requirements: Iterable[RT], max_rounds: int) -> State[RT, CT, KT]:
+    def resolve(
+        self,
+        requirements: Iterable[RT],
+        max_rounds: int,
+        constraints: Iterable[RequirementInformation[RT, CT]] | None = None,
+    ) -> State[RT, CT, KT]:
         if self._states:
             raise RuntimeError("already resolved")
 
         self._r.starting()
+
+        # Merge constraints up front. They only filter provider candidates and
+        # are never added to criteria, so they cannot be pinned or leak into
+        # failure causes.
+        self._constraints = self._merge_constraints(constraints or ())
 
         # Initialize the root state.
         self._states = [
@@ -433,7 +502,7 @@ class Resolution(Generic[RT, CT, KT]):
             try:
                 self._add_to_criteria(self.state.criteria, r, parent=None)
             except RequirementsConflicted as e:
-                raise ResolutionImpossible(e.criterion.information) from e
+                raise self._impossible(list(e.criterion.information)) from e
 
         # The root state is saved as a sentinel so the first ever pin can have
         # something to backtrack to if it fails. The root state is basically
@@ -539,7 +608,7 @@ class Resolution(Generic[RT, CT, KT]):
 
                     # Dead ends everywhere. Give up.
                     if not success:
-                        raise ResolutionImpossible(self.state.backtrack_causes)
+                        raise self._impossible(self.state.backtrack_causes)
             else:
                 # discard as information sources any invalidated names
                 # (unsatisfied names that were previously satisfied)
@@ -569,6 +638,7 @@ class Resolver(AbstractResolver[RT, CT, KT]):
         self,
         requirements: Iterable[RT],
         max_rounds: int = 100,
+        constraints: Iterable[RequirementInformation[RT, CT]] | None = None,
     ) -> Result[RT, CT, KT]:
         """Take a collection of constraints, spit out the resolution result.
 
@@ -592,13 +662,27 @@ class Resolver(AbstractResolver[RT, CT, KT]):
             combination of requirements. The `causes` attribute of the
             exception is a list of (requirement, parent), giving the
             requirements that could not be satisfied.
+        * `ConstraintsConflicted`: A subclass of `ResolutionImpossible`,
+            raised instead when the failure is caused by `constraints`. Its
+            `causes` attribute only contains information from the
+            requirements side; constraints never appear in it.
         * `ResolutionTooDeep`: The dependency tree is too deeply nested and
             the resolver gave up. This is usually caused by a circular
             dependency, but you can try to resolve this by increasing the
             `max_rounds` argument.
+
+        :param requirements: A collection of requirements to resolve.
+        :param max_rounds: Maximum number of rounds before giving up.
+        :param constraints: An optional collection of (requirement, parent)
+            pairs, shaped like the requirement information held by criteria.
+            Constraints only filter the candidates returned by the provider
+            (re-applied after every backtrack); they are never pinned and
+            never appear in failure causes.
         """
         resolution = Resolution(self.provider, self.reporter)
-        state = resolution.resolve(requirements, max_rounds=max_rounds)
+        state = resolution.resolve(
+            requirements, max_rounds=max_rounds, constraints=constraints
+        )
         return _build_result(state)
 
 

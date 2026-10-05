@@ -51,6 +51,20 @@ class ResolutionImpossible(ResolutionError, Generic[RT, CT]):
         self.causes = causes
 
 
+class ConstraintsConflicted(ResolutionImpossible[RT, CT]):
+    """Resolution cannot succeed because of the constraints given to resolve().
+
+    Raised instead of :class:`ResolutionImpossible` when constraints are
+    responsible for the failure, e.g. a requirement asks for ``>=2`` while
+    the constraints only allow ``<2``.
+
+    Constraints themselves never participate in pinning, and ``causes`` only
+    contains information from the requirements side (never the constraints),
+    so callers can report this failure distinctly without leaking the
+    internal-repository whitelist that produced them.
+    """
+
+
 class ResolutionTooDeep(ResolutionError):
     def __init__(self, round_count: int) -> None:
         super().__init__(round_count)

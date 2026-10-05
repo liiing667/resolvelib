@@ -10,10 +10,12 @@ from packaging.version import Version
 from resolvelib import (
     AbstractProvider,
     BaseReporter,
+    ConstraintsConflicted,
     InconsistentCandidate,
     ResolutionImpossible,
 )
 from resolvelib.resolvers import (
+    RequirementInformation,
     RequirementsConflicted,
     Resolution,
     Resolver,
@@ -268,3 +270,130 @@ def test_pin_conflict_with_self(monkeypatch, reporter):
     assert result.mapping["parent"][1] == Version("1")
     assert result.mapping["child"][1] == Version("1")
     assert result.mapping["grandchild"][1] == Version("1")
+
+
+class _ConstraintTestProvider(AbstractProvider):
+    """Provider using (name, versions) requirements and (name, version, deps)
+    candidates, preferring the order candidates are declared in."""
+
+    def __init__(self, all_candidates):
+        self.all_candidates = all_candidates
+
+    def identify(self, requirement_or_candidate):
+        return requirement_or_candidate[0]
+
+    def get_preference(self, **_):
+        return 0
+
+    def get_dependencies(self, candidate):
+        return candidate[2]
+
+    def find_matches(self, identifier, requirements, incompatibilities):
+        bad = list(incompatibilities[identifier])
+        return [
+            candidate
+            for candidate in self.all_candidates[identifier]
+            if all(self.is_satisfied_by(r, candidate) for r in requirements[identifier])
+            and candidate not in bad
+        ]
+
+    def is_satisfied_by(self, requirement, candidate):
+        return candidate[1] in requirement[1]
+
+
+def test_constraints_filter_candidates():
+    all_candidates = {"foo": [("foo", 3, []), ("foo", 2, []), ("foo", 1, [])]}
+    resolver = Resolver(_ConstraintTestProvider(all_candidates), BaseReporter())
+    result = resolver.resolve(
+        [("foo", {1, 2, 3})],
+        constraints=[RequirementInformation(("foo", {1, 2}), None)],
+    )
+    assert result.mapping["foo"] == ("foo", 2, [])
+    # Constraints do not contribute to criteria information.
+    information = result.criteria["foo"].information
+    assert [info.requirement for info in information] == [("foo", {1, 2, 3})]
+
+
+def test_constraints_accept_plain_pairs():
+    all_candidates = {"foo": [("foo", 2, []), ("foo", 1, [])]}
+    resolver = Resolver(_ConstraintTestProvider(all_candidates), BaseReporter())
+    result = resolver.resolve(
+        [("foo", {1, 2})],
+        constraints=[(("foo", {1}), None)],
+    )
+    assert result.mapping["foo"] == ("foo", 1, [])
+
+
+def test_constraints_apply_after_backtracking():
+    # c2 depends on d{2}, which the constraint forbids. The resolver must
+    # reject c2, backtrack, and keep d2 excluded no matter which dependency
+    # path leads to d.
+    all_candidates = {
+        "a": [("a", 1, [("c", {1, 2})])],
+        "b": [("b", 1, [("d", {1})])],
+        "c": [("c", 2, [("d", {2})]), ("c", 1, [])],
+        "d": [("d", 2, []), ("d", 1, [])],
+    }
+    resolver = Resolver(_ConstraintTestProvider(all_candidates), BaseReporter())
+    result = resolver.resolve(
+        [("a", {1}), ("b", {1})],
+        constraints=[RequirementInformation(("d", {1}), None)],
+    )
+    assert result.mapping["a"] == ("a", 1, [("c", {1, 2})])
+    assert result.mapping["b"] == ("b", 1, [("d", {1})])
+    assert result.mapping["c"] == ("c", 1, [])
+    assert result.mapping["d"] == ("d", 1, [])
+
+
+def test_constraints_conflicting_with_requirements():
+    all_candidates = {"foo": [("foo", 2, []), ("foo", 1, [])]}
+    resolver = Resolver(_ConstraintTestProvider(all_candidates), BaseReporter())
+    with pytest.raises(ConstraintsConflicted) as ctx:
+        resolver.resolve(
+            [("foo", {2})],
+            constraints=[RequirementInformation(("foo", {1}), None)],
+        )
+    # Still a ResolutionImpossible for existing error-handling code, and the
+    # causes only carry the requirements side, never the constraints.
+    assert isinstance(ctx.value, ResolutionImpossible)
+    assert ctx.value.causes == [RequirementInformation(("foo", {2}), None)]
+
+
+def test_constraints_merged_deterministically():
+    all_candidates = {"foo": [("foo", 3, []), ("foo", 2, []), ("foo", 1, [])]}
+    constraints = [
+        RequirementInformation(("foo", {1, 2}), None),
+        RequirementInformation(("foo", {1, 2}), None),  # duplicate
+        RequirementInformation(("foo", {2, 3}), None),
+    ]
+    results = []
+    for _ in range(2):
+        resolver = Resolver(_ConstraintTestProvider(all_candidates), BaseReporter())
+        results.append(
+            resolver.resolve([("foo", {1, 2, 3})], constraints=constraints)
+        )
+    assert results[0].mapping == results[1].mapping
+    assert results[0].mapping["foo"] == ("foo", 2, [])
+
+
+def test_contradictory_constraints_deterministic_causes():
+    all_candidates = {"foo": [("foo", 2, []), ("foo", 1, [])]}
+    constraints = [
+        RequirementInformation(("foo", {1}), None),
+        RequirementInformation(("foo", {2}), None),
+    ]
+    all_causes = []
+    for _ in range(2):
+        resolver = Resolver(_ConstraintTestProvider(all_candidates), BaseReporter())
+        with pytest.raises(ConstraintsConflicted) as ctx:
+            resolver.resolve([("foo", {1, 2})], constraints=constraints)
+        all_causes.append(ctx.value.causes)
+    assert all_causes[0] == all_causes[1]
+    assert all_causes[0] == [RequirementInformation(("foo", {1, 2}), None)]
+
+
+def test_resolve_without_constraints_unchanged():
+    all_candidates = {"foo": [("foo", 2, []), ("foo", 1, [])]}
+    resolver = Resolver(_ConstraintTestProvider(all_candidates), BaseReporter())
+    result = resolver.resolve([("foo", {1, 2})])
+    assert result.mapping["foo"] == ("foo", 2, [])
